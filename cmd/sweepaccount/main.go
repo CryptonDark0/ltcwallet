@@ -1,13 +1,17 @@
-// Copyright (c) 2015-2016 The btcsuite developers
+// Copyright (c) 2015-2023 The ltcsuite developers
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
 
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync/atomic"
+	"time"
 
 	"github.com/jessevdk/go-flags"
 	"github.com/ltcsuite/ltcd/btcjson"
@@ -24,23 +28,18 @@ import (
 	"golang.org/x/term"
 )
 
-var (
-	walletDataDirectory = ltcutil.AppDataDir("ltcwallet", false)
-	newlineBytes        = []byte{'\n'}
+const (
+	defaultRPCTimeout    = 30 * time.Second
+	defaultWalletTimeout = 60 * time.Second
+	maxPassAttempts      = 3
+	version              = "1.2.0"
 )
 
-func fatalf(format string, args ...interface{}) {
-	fmt.Fprintf(os.Stderr, format, args...)
-	os.Stderr.Write(newlineBytes)
-	os.Exit(1)
-}
+var (
+	walletDataDirectory = ltcutil.AppDataDir("ltcwallet", false)
+)
 
-func errContext(err error, context string) error {
-	return fmt.Errorf("%s: %v", context, err)
-}
-
-// Flags.
-var opts = struct {
+type config struct {
 	TestNet3              bool                `long:"testnet" description:"Use the test litecoin network (version 4)"`
 	SimNet                bool                `long:"simnet" description:"Use the simulation bitcoin network"`
 	RPCConnect            string              `short:"c" long:"connect" description:"Hostname[:port] of wallet RPC server"`
@@ -50,296 +49,278 @@ var opts = struct {
 	SourceAccount         string              `long:"sourceacct" description:"Account to sweep outputs from"`
 	DestinationAccount    string              `long:"destacct" description:"Account to send sweeped outputs to"`
 	RequiredConfirmations int64               `long:"minconf" description:"Required confirmations to include an output"`
-}{
-	TestNet3:              false,
-	SimNet:                false,
-	RPCConnect:            "localhost",
-	RPCUsername:           "",
-	RPCCertificateFile:    filepath.Join(walletDataDirectory, "rpc.cert"),
-	FeeRate:               cfgutil.NewAmountFlag(txrules.DefaultRelayFeePerKb),
-	SourceAccount:         "imported",
-	DestinationAccount:    "default",
-	RequiredConfirmations: 1,
+	Version               bool                `long:"version" description:"Display version information and exit"`
 }
 
-// Parse and validate flags.
-func init() {
-	// Unset localhost defaults if certificate file can not be found.
-	certFileExists, err := cfgutil.FileExists(opts.RPCCertificateFile)
-	if err != nil {
-		fatalf("%v", err)
-	}
-	if !certFileExists {
-		opts.RPCConnect = ""
-		opts.RPCCertificateFile = ""
-	}
-
-	_, err = flags.Parse(&opts)
-	if err != nil {
-		os.Exit(1)
-	}
-
-	if opts.TestNet3 && opts.SimNet {
-		fatalf("Multiple bitcoin networks may not be used simultaneously")
-	}
-	var activeNet = &netparams.MainNetParams
-	if opts.TestNet3 {
-		activeNet = &netparams.TestNet4Params
-	} else if opts.SimNet {
-		activeNet = &netparams.SimNetParams
-	}
-
-	if opts.RPCConnect == "" {
-		fatalf("RPC hostname[:port] is required")
-	}
-	rpcConnect, err := cfgutil.NormalizeAddress(opts.RPCConnect, activeNet.RPCServerPort)
-	if err != nil {
-		fatalf("Invalid RPC network address `%v`: %v", opts.RPCConnect, err)
-	}
-	opts.RPCConnect = rpcConnect
-
-	if opts.RPCUsername == "" {
-		fatalf("RPC username is required")
-	}
-
-	certFileExists, err = cfgutil.FileExists(opts.RPCCertificateFile)
-	if err != nil {
-		fatalf("%v", err)
-	}
-	if !certFileExists {
-		fatalf("RPC certificate file `%s` not found", opts.RPCCertificateFile)
-	}
-
-	if opts.FeeRate.Amount > 1e6 {
-		fatalf("Fee rate `%v/kB` is exceptionally high", opts.FeeRate.Amount)
-	}
-	if opts.FeeRate.Amount < 1e2 {
-		fatalf("Fee rate `%v/kB` is exceptionally low", opts.FeeRate.Amount)
-	}
-	if opts.SourceAccount == opts.DestinationAccount {
-		fatalf("Source and destination accounts should not be equal")
-	}
-	if opts.RequiredConfirmations < 0 {
-		fatalf("Required confirmations must be non-negative")
-	}
-}
-
-// noInputValue describes an error returned by the input source when no inputs
-// were selected because each previous output value was zero.  Callers of
-// txauthor.NewUnsignedTransaction need not report these errors to the user.
-type noInputValue struct {
-}
-
-func (noInputValue) Error() string { return "no input value" }
-
-// makeInputSource creates an InputSource that creates inputs for every unspent
-// output with non-zero output values.  The target amount is ignored since every
-// output is consumed.  The InputSource does not return any previous output
-// scripts as they are not needed for creating the unsinged transaction and are
-// looked up again by the wallet during the call to signrawtransaction.
-func makeInputSource(outputs []btcjson.ListUnspentResult) txauthor.InputSource {
-	var (
-		totalInputValue ltcutil.Amount
-		inputs          = make([]*wire.TxIn, 0, len(outputs))
-		inputValues     = make([]ltcutil.Amount, 0, len(outputs))
-		sourceErr       error
-	)
-	for _, output := range outputs {
-		output := output
-
-		outputAmount, err := ltcutil.NewAmount(output.Amount)
-		if err != nil {
-			sourceErr = fmt.Errorf(
-				"invalid amount `%v` in listunspent result",
-				output.Amount)
-			break
-		}
-		if outputAmount == 0 {
-			continue
-		}
-		if !saneOutputValue(outputAmount) {
-			sourceErr = fmt.Errorf(
-				"impossible output amount `%v` in listunspent result",
-				outputAmount)
-			break
-		}
-		totalInputValue += outputAmount
-
-		previousOutPoint, err := parseOutPoint(&output)
-		if err != nil {
-			sourceErr = fmt.Errorf(
-				"invalid data in listunspent result: %v",
-				err)
-			break
-		}
-
-		inputs = append(inputs, wire.NewTxIn(&previousOutPoint, nil, nil))
-		inputValues = append(inputValues, outputAmount)
-	}
-
-	if sourceErr == nil && totalInputValue == 0 {
-		sourceErr = noInputValue{}
-	}
-
-	return func(ltcutil.Amount) (ltcutil.Amount, []*wire.TxIn, []ltcutil.Amount, [][]byte, error) {
-		return totalInputValue, inputs, inputValues, nil, sourceErr
-	}
-}
-
-// makeDestinationScriptSource creates a ChangeSource which is used to receive
-// all correlated previous input value.  A non-change address is created by this
-// function.
-func makeDestinationScriptSource(rpcClient *rpcclient.Client, accountName string) *txauthor.ChangeSource {
-
-	// GetNewAddress always returns a P2PKH address since it assumes
-	// BIP-0044.
-	newChangeScript := func() ([]byte, error) {
-		destinationAddress, err := rpcClient.GetNewAddress(accountName)
-		if err != nil {
-			return nil, err
-		}
-		return txscript.PayToAddrScript(destinationAddress)
-	}
-
-	return &txauthor.ChangeSource{
-		ScriptSize: txsizes.P2PKHPkScriptSize,
-		NewScript:  newChangeScript,
-	}
+type sweepResult struct {
+	txHash       *chainhash.Hash
+	amount       ltcutil.Amount
+	err          error
 }
 
 func main() {
-	err := sweep()
-	if err != nil {
-		fatalf("%v", err)
+	if err := run(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
 	}
 }
 
-func sweep() error {
-	rpcPassword, err := promptSecret("Wallet RPC password")
+func run() error {
+	cfg, err := loadConfig()
 	if err != nil {
-		return errContext(err, "failed to read RPC password")
+		return fmt.Errorf("configuration error: %w", err)
 	}
 
-	// Open RPC client.
-	rpcCertificate, err := os.ReadFile(opts.RPCCertificateFile)
-	if err != nil {
-		return errContext(err, "failed to read RPC certificate")
+	if cfg.Version {
+		fmt.Printf("ltcwallet-sweep v%s\n", version)
+		return nil
 	}
-	rpcClient, err := rpcclient.New(&rpcclient.ConnConfig{
-		Host:         opts.RPCConnect,
-		User:         opts.RPCUsername,
-		Pass:         rpcPassword,
-		Certificates: rpcCertificate,
-		HTTPPostMode: true,
-	}, nil)
+
+	rpcPassword, err := promptSecret("Wallet RPC password", maxPassAttempts)
 	if err != nil {
-		return errContext(err, "failed to create RPC client")
+		return fmt.Errorf("failed to get RPC password: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), defaultRPCTimeout)
+	defer cancel()
+
+	rpcClient, err := createRPCClient(ctx, cfg, rpcPassword)
+	if err != nil {
+		return fmt.Errorf("RPC connection failed: %w", err)
 	}
 	defer rpcClient.Shutdown()
 
-	// Fetch all unspent outputs, ignore those not from the source
-	// account, and group by their destination address.  Each grouping of
-	// outputs will be used as inputs for a single transaction sending to a
-	// new destination account address.
 	unspentOutputs, err := rpcClient.ListUnspent()
 	if err != nil {
-		return errContext(err, "failed to fetch unspent outputs")
-	}
-	sourceOutputs := make(map[string][]btcjson.ListUnspentResult)
-	for _, unspentOutput := range unspentOutputs {
-		if !unspentOutput.Spendable {
-			continue
-		}
-		if unspentOutput.Confirmations < opts.RequiredConfirmations {
-			continue
-		}
-		if unspentOutput.Account != opts.SourceAccount {
-			continue
-		}
-		sourceAddressOutputs := sourceOutputs[unspentOutput.Address]
-		sourceOutputs[unspentOutput.Address] = append(sourceAddressOutputs, unspentOutput)
+		return fmt.Errorf("failed to fetch unspent outputs: %w", err)
 	}
 
-	var privatePassphrase string
-	if len(sourceOutputs) != 0 {
-		privatePassphrase, err = promptSecret("Wallet private passphrase")
-		if err != nil {
-			return errContext(err, "failed to read private passphrase")
-		}
+	sourceOutputs := filterOutputs(unspentOutputs, cfg.SourceAccount, cfg.RequiredConfirmations)
+	if len(sourceOutputs) == 0 {
+		fmt.Println("No outputs to sweep")
+		return nil
 	}
 
-	var totalSwept ltcutil.Amount
-	var numErrors int
-	var reportError = func(format string, args ...interface{}) {
-		fmt.Fprintf(os.Stderr, format, args...)
-		os.Stderr.Write(newlineBytes)
-		numErrors++
+	privatePassphrase, err := promptSecret("Wallet private passphrase", maxPassAttempts)
+	if err != nil {
+		return fmt.Errorf("failed to get private passphrase: %w", err)
 	}
-	for _, previousOutputs := range sourceOutputs {
-		inputSource := makeInputSource(previousOutputs)
-		destinationSource := makeDestinationScriptSource(rpcClient, opts.DestinationAccount)
-		tx, err := txauthor.NewUnsignedTransaction(nil, opts.FeeRate.Amount,
-			inputSource, destinationSource)
-		if err != nil {
-			if err != (noInputValue{}) {
-				reportError("Failed to create unsigned transaction: %v", err)
+
+	results := make(chan sweepResult, len(sourceOutputs))
+	var totalSwept atomic.Int64
+	var errorCount atomic.Int32
+
+	for addr, outputs := range sourceOutputs {
+		go func(addr string, outputs []btcjson.ListUnspentResult) {
+			res := sweepOutputs(rpcClient, outputs, addr, cfg.DestinationAccount, 
+				cfg.FeeRate.Amount, privatePassphrase)
+			if res.err == nil {
+				totalSwept.Add(int64(res.amount))
+			} else {
+				errorCount.Add(1)
 			}
-			continue
-		}
+			results <- res
+		}(addr, outputs)
+	}
 
-		// Unlock the wallet, sign the transaction, and immediately lock.
-		err = rpcClient.WalletPassphrase(privatePassphrase, 60)
-		if err != nil {
-			reportError("Failed to unlock wallet: %v", err)
+	// Collect and print results
+	for range sourceOutputs {
+		res := <-results
+		if res.err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to sweep %s: %v\n", res.txHash, res.err)
 			continue
 		}
-		signedTransaction, complete, err := rpcClient.SignRawTransaction(tx.Tx)
-		_ = rpcClient.WalletLock()
-		if err != nil {
-			reportError("Failed to sign transaction: %v", err)
-			continue
-		}
-		if !complete {
-			reportError("Failed to sign every input")
-			continue
-		}
-
-		// Publish the signed sweep transaction.
-		txHash, err := rpcClient.SendRawTransaction(signedTransaction, false)
-		if err != nil {
-			reportError("Failed to publish transaction: %v", err)
-			continue
-		}
-
-		outputAmount := ltcutil.Amount(tx.Tx.TxOut[0].Value)
 		fmt.Printf("Swept %v to destination account with transaction %v\n",
-			outputAmount, txHash)
-		totalSwept += outputAmount
+			res.amount, res.txHash)
 	}
 
-	numPublished := len(sourceOutputs) - numErrors
-	transactionNoun := pickNoun(numErrors, "transaction", "transactions")
-	if numPublished != 0 {
-		fmt.Printf("Swept %v to destination account across %d %s\n",
-			totalSwept, numPublished, transactionNoun)
-	}
-	if numErrors > 0 {
-		return fmt.Errorf("failed to publish %d %s", numErrors,
-			transactionNoun)
-	}
+	total := ltcutil.Amount(totalSwept.Load())
+	fmt.Printf("Successfully swept %v across %d transactions\n", 
+		total, len(sourceOutputs)-int(errorCount.Load()))
 
+	if errorCount.Load() > 0 {
+		return fmt.Errorf("failed to sweep %d outputs", errorCount.Load())
+	}
 	return nil
 }
 
-func promptSecret(what string) (string, error) {
-	fmt.Printf("%s: ", what)
-	fd := int(os.Stdin.Fd())
-	input, err := term.ReadPassword(fd)
-	fmt.Println()
-	if err != nil {
-		return "", err
+func loadConfig() (*config, error) {
+	cfg := &config{
+		RPCConnect:         "localhost",
+		RPCCertificateFile: filepath.Join(walletDataDirectory, "rpc.cert"),
+		FeeRate:            cfgutil.NewAmountFlag(txrules.DefaultRelayFeePerKb),
+		SourceAccount:      "imported",
+		DestinationAccount: "default",
+		RequiredConfirmations: 1,
 	}
-	return string(input), nil
+
+	parser := flags.NewParser(cfg, flags.Default)
+	if _, err := parser.Parse(); err != nil {
+		return nil, err
+	}
+
+	if cfg.TestNet3 && cfg.SimNet {
+		return nil, errors.New("multiple networks may not be used simultaneously")
+	}
+
+	if cfg.RPCConnect == "" {
+		return nil, errors.New("RPC hostname[:port] is required")
+	}
+
+	if cfg.RPCUsername == "" {
+		return nil, errors.New("RPC username is required")
+	}
+
+	if _, err := os.Stat(cfg.RPCCertificateFile); err != nil {
+		return nil, fmt.Errorf("RPC certificate file not found: %w", err)
+	}
+
+	if cfg.FeeRate.Amount > 1e6 {
+		return nil, fmt.Errorf("fee rate %v/kB is exceptionally high", cfg.FeeRate.Amount)
+	}
+
+	if cfg.FeeRate.Amount < 1e2 {
+		return nil, fmt.Errorf("fee rate %v/kB is exceptionally low", cfg.FeeRate.Amount)
+	}
+
+	if cfg.SourceAccount == cfg.DestinationAccount {
+		return nil, errors.New("source and destination accounts should not be equal")
+	}
+
+	if cfg.RequiredConfirmations < 0 {
+		return nil, errors.New("required confirmations must be non-negative")
+	}
+
+	return cfg, nil
+}
+
+func createRPCClient(ctx context.Context, cfg *config, password string) (*rpcclient.Client, error) {
+	cert, err := os.ReadFile(cfg.RPCCertificateFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read RPC certificate: %w", err)
+	}
+
+	connCfg := &rpcclient.ConnConfig{
+		Host:         cfg.RPCConnect,
+		User:         cfg.RPCUsername,
+		Pass:         password,
+		Certificates: cert,
+		HTTPPostMode: true,
+	}
+
+	return rpcclient.New(connCfg, nil)
+}
+
+func filterOutputs(outputs []btcjson.ListUnspentResult, account string, minConf int64) map[string][]btcjson.ListUnspentResult {
+	result := make(map[string][]btcjson.ListUnspentResult)
+	for _, output := range outputs {
+		if !output.Spendable || 
+		   output.Confirmations < minConf || 
+		   output.Account != account {
+			continue
+		}
+		result[output.Address] = append(result[output.Address], output)
+	}
+	return result
+}
+
+func sweepOutputs(
+	client *rpcclient.Client,
+	outputs []btcjson.ListUnspentResult,
+	sourceAddr string,
+	destAccount string,
+	feeRate ltcutil.Amount,
+	passphrase string,
+) sweepResult {
+	inputSource := createInputSource(outputs)
+	destSource := createDestinationSource(client, destAccount)
+
+	tx, err := txauthor.NewUnsignedTransaction(nil, feeRate, inputSource, destSource)
+	if err != nil {
+		return sweepResult{err: fmt.Errorf("create tx failed: %w", err)}
+	}
+
+	if err := client.WalletPassphrase(passphrase, defaultWalletTimeout); err != nil {
+		return sweepResult{err: fmt.Errorf("unlock failed: %w", err)}
+	}
+	defer client.WalletLock()
+
+	signedTx, complete, err := client.SignRawTransaction(tx.Tx)
+	if err != nil {
+		return sweepResult{err: fmt.Errorf("sign failed: %w", err)}
+	}
+	if !complete {
+		return sweepResult{err: errors.New("not all inputs signed")}
+	}
+
+	txHash, err := client.SendRawTransaction(signedTx, false)
+	if err != nil {
+		return sweepResult{err: fmt.Errorf("send failed: %w", err)}
+	}
+
+	return sweepResult{
+		txHash: txHash,
+		amount: ltcutil.Amount(tx.Tx.TxOut[0].Value),
+	}
+}
+
+func createInputSource(outputs []btcjson.ListUnspentResult) txauthor.InputSource {
+	var (
+		total ltcutil.Amount
+		inputs []*wire.TxIn
+		values []ltcutil.Amount
+	)
+
+	for _, output := range outputs {
+		amount, err := ltcutil.NewAmount(output.Amount)
+		if err != nil || amount == 0 || !saneOutputValue(amount) {
+			continue
+		}
+
+		outpoint, err := parseOutPoint(&output)
+		if err != nil {
+			continue
+		}
+
+		total += amount
+		inputs = append(inputs, wire.NewTxIn(&outpoint, nil, nil))
+		values = append(values, amount)
+	}
+
+	return func(ltcutil.Amount) (ltcutil.Amount, []*wire.TxIn, []ltcutil.Amount, [][]byte, error) {
+		if total == 0 {
+			return 0, nil, nil, nil, errors.New("no input value")
+		}
+		return total, inputs, values, nil, nil
+	}
+}
+
+func createDestinationSource(client *rpcclient.Client, account string) *txauthor.ChangeSource {
+	return &txauthor.ChangeSource{
+		ScriptSize: txsizes.P2PKHPkScriptSize,
+		NewScript: func() ([]byte, error) {
+			addr, err := client.GetNewAddress(account)
+			if err != nil {
+				return nil, err
+			}
+			return txscript.PayToAddrScript(addr)
+		},
+	}
+}
+
+func promptSecret(prompt string, maxAttempts int) (string, error) {
+	for i := 0; i < maxAttempts; i++ {
+		fmt.Printf("%s: ", prompt)
+		pass, err := term.ReadPassword(int(os.Stdin.Fd()))
+		fmt.Println()
+		if err != nil {
+			return "", err
+		}
+		if len(pass) > 0 {
+			return string(pass), nil
+		}
+	}
+	return "", errors.New("maximum attempts reached")
 }
 
 func saneOutputValue(amount ltcutil.Amount) bool {
@@ -352,11 +333,4 @@ func parseOutPoint(input *btcjson.ListUnspentResult) (wire.OutPoint, error) {
 		return wire.OutPoint{}, err
 	}
 	return wire.OutPoint{Hash: *txHash, Index: input.Vout}, nil
-}
-
-func pickNoun(n int, singularForm, pluralForm string) string {
-	if n == 1 {
-		return singularForm
-	}
-	return pluralForm
 }
